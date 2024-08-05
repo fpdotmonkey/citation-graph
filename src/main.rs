@@ -1,86 +1,58 @@
 use std::collections::{HashMap, HashSet};
 
-use serde::Deserialize;
-use slotmap::{new_key_type, SlotMap};
-
 mod semantic_scholar;
-use semantic_scholar::{get_paper_batch, PaperId};
+use semantic_scholar::{Paper, PaperId, ProtoPaper, SemanticScholar};
 
-const SEMANTIC_SCHOLAR_BATCH: &str = "https://api.semanticscholar.org/graph/v1/paper/batch";
-const MAX_PAPERS_PER_CALL: usize = 500;
-
-// #[derive(Debug, Deserialize, Clone)]
-// struct Paper {
-//     #[serde(rename = "paperId")]
-//     id: String,
-//     title: String,
-//     url: String,
-//     references: Vec<Reference>,
-// }
-
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
-struct ProtoPaper {
-    #[serde(rename = "paperId")]
-    id: Option<String>,
-    title: String,
+struct StagingData {
+    citation_count: usize,
+    paper: Paper,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+type Staging = HashMap<String, StagingData>;
+
+#[derive(Default, PartialEq, Eq, Hash)]
 struct Reference {
-    referencee: ProtoPaper,
-    referencer: PaperNodeKey,
+    referencer: String,
+    referencee: String,
 }
 
-#[derive(Default, Clone)]
-struct ReferenceList {
-    list: HashSet<Reference>,
-}
+type PaperList = HashSet<ProtoPaper>;
+type ReferenceList = HashSet<Reference>;
 
-new_key_type! { struct PaperNodeKey; }
-
-impl ReferenceList {
-    fn iter(&self) -> std::collections::hash_set::Iter<Reference> {
-        self.list.iter()
-    }
-}
-
-impl Reference {
-    fn referencee(&self) -> &ProtoPaper {
-        &self.referencee
-    }
-}
-
-impl Extend<Reference> for ReferenceList {
-    fn extend<I: IntoIterator<Item = Reference>>(&mut self, references: I) {
-        for reference in references {
-            self.list.insert(reference);
+impl Extend<Paper> for Staging {
+    /// Use the Semantic Scholar ID as the key and set the citation count to 1.
+    fn extend<I: IntoIterator<Item = Paper>>(&mut self, papers: I) {
+        for paper in papers {
+            let id = paper.id().to_owned();
+            if let Some(staged) = self.insert(
+                id.clone(),
+                StagingData {
+                    citation_count: 1,
+                    paper,
+                },
+            ) {
+                self.get_mut(&id).unwrap().citation_count = std::cmp::max(1, staged.citation_count);
+            }
         }
     }
 }
 
-/// Escape `"` and `\\` with `\\`.
-fn escape(s: String) -> String {
-    s.replace("\\", "\\\\").replace("\"", "\\\"")
+/// Escape `"` and replace `\` with `\\`.
+fn escape<'a>(s: impl Into<&'a str>) -> String {
+    s.into().replace('\\', "\\\\").replace('\"', "\\\"")
 }
 
-/// How many citations does `paper` have?
-fn reference_count(reference_list: ReferenceList, paper: PaperNodeKey) -> usize {
-    reference_list
+fn from_staging(staging: &Staging) -> PaperList {
+    staging
         .iter()
-        .filter(|reference| reference.referencee() == paper)
-        .count()
+        .map(|(_, data)| <Paper as Into<ProtoPaper>>::into(data.paper.clone()))
+        .collect()
 }
 
 #[tokio::main]
 async fn main() -> reqwest::Result<()> {
-    let mut paper_list = SlotMap::<PaperNodeKey, semantic_scholar::Paper>::with_key();
-    let mut reference_list = HashSet::<(PaperNodeKey, PaperNodeKey)>::new();
+    let api = SemanticScholar::default();
 
-    let client = reqwest::Client::new();
-    let params = [("fields", "title,url,references")];
-
-    // one request before the loop to avoid creating a special cases
-    let mut ids = HashMap::new();
     let paper_ids = vec![
         PaperId::Doi("10.1016/j.jterra.2024.100989".to_string()),
         PaperId::Doi("10.1016/j.jterra.2024.100988".to_string()),
@@ -94,89 +66,117 @@ async fn main() -> reqwest::Result<()> {
         PaperId::Doi("10.1016/j.jterra.2024.100987".to_string()),
         PaperId::Doi("10.1016/j.jterra.2024.100986".to_string()),
     ];
-    ids.insert("ids", paper_ids);
-    let papers = get_paper_batch(paper_ids).await?;
-    let mut staged_references = ReferenceList::default();
-    for paper in papers {
-        let referencer = paper_list.insert(paper.clone());
-        staged_references.extend(paper.references().iter().map(|reference| StagedReference {
-            referencee: reference.clone(),
-            referencer,
-        }));
-    }
+    let mut staging = Staging::default();
+    // one request before the loop to avoid creating a special cases
+    staging.extend(api.get_paper_batch(paper_ids).await?);
+    let mut paper_list = from_staging(&staging);
+    let mut reference_list = ReferenceList::default();
 
     // And now the rest of the requests.
-    for depth in 0..3 {
-        let paper_ids: Vec<_> = staged_references
-            .iter()
-            .filter_map(|reference| reference.reference.id.clone())
-            .map(|id| PaperId::SsId(id))
-            .collect();
-        let mut papers = get_paper_batch(paper_ids).await?;
-        let old_staged_references = staged_references.clone();
-        staged_references.clear();
-        for paper in papers {
-            let Some(paper) = paper else {
-                continue;
-            };
-
-            let maybe_key = paper_list.iter().find(|(_, other)| other.url == paper.url);
-            let referencee_key = if maybe_key.is_some() {
-                maybe_key.unwrap().0
-            } else {
-                let key = paper_list.insert(paper.clone());
-                staged_references.extend(paper.references.iter().map(|referencee| {
-                    StagedReference {
-                        referencee: referencee.clone(),
-                        referencer: key,
-                    }
-                }));
-                key
-            };
-            if reference_count(reference_list, referencee_key) < depth {
+    for depth in 0..4 {
+        eprintln!("depth={depth}");
+        let mut staged_paper_list = PaperList::default();
+        let mut staged_reference_list = ReferenceList::default();
+        let mut remove_staged = Vec::<String>::default();
+        let mut batched_papers = Vec::<PaperId>::default();
+        for (id, staged) in &staging {
+            if staged.citation_count < (depth as f64 * 1.6).exp().floor() as usize {
                 continue;
             }
-
-            let referencer_key: PaperNodeKey = staged_references
-                .iter()
-                .find(|staged_reference| staged_reference.referencee.title == paper.title)
-                .expect("missing referencer")
-                .referencer;
-            reference_list.insert((referencer_key, referencee_key));
+            staged_reference_list.extend(
+                staged
+                    .paper
+                    .references()
+                    .iter()
+                    .filter_map(|reference| reference.id())
+                    .map(|ref_id| Reference {
+                        referencer: id.clone(),
+                        referencee: ref_id.to_string(),
+                    }),
+            );
+            staged_paper_list.extend(
+                staged
+                    .paper
+                    .references()
+                    .iter()
+                    .filter(|paper| paper.id().is_some())
+                    .cloned(),
+            );
+            batched_papers.extend(
+                staged
+                    .paper
+                    .references()
+                    .iter()
+                    .filter_map(|reference| reference.id())
+                    .map(|id| PaperId::SemanticScholar(id.to_string())),
+            );
+            remove_staged.push(id.clone());
         }
+        for id in remove_staged {
+            staging.remove(&id);
+        }
+        let new_papers = api.get_paper_batch(batched_papers).await?;
+        let new_papers_again = new_papers.clone();
+        let reference_increments: Vec<_> = new_papers_again
+            .iter()
+            .flat_map(|paper| paper.references())
+            .collect();
+        staging.extend(new_papers);
+        for reference in reference_increments {
+            let Some(ref_id) = reference.id() else {
+                continue;
+            };
+            if let Some((_id, staged)) = staging
+                .iter_mut()
+                .find(|(_id, staged)| staged.paper.id() == ref_id)
+            {
+                staged.citation_count += 1;
+            }
+        }
+        reference_list.extend(staged_reference_list);
+        paper_list.extend(staged_paper_list);
     }
 
-    // only use those references that were cited enough
-    for _ in 0..20 {
-        paper_list.retain(|paper_key, _| {
+    // pruning
+    for _ in 0..10 {
+        paper_list.retain(|paper| {
             !(reference_list
                 .iter()
-                .filter(|(_, referencee)| *referencee == paper_key)
+                .filter(|reference| Some(reference.referencee.clone()).as_deref() == paper.id())
                 .count()
-                == 1
+                <= 1
                 && reference_list
                     .iter()
-                    .filter(|(referencer, _)| *referencer == paper_key)
+                    .filter(|reference| Some(reference.referencer.clone()).as_deref() == paper.id())
                     .count()
-                    == 0)
+                    <= 1)
         });
-        reference_list.retain(|(referencer, referencee)| {
-            paper_list.contains_key(*referencer) && paper_list.contains_key(*referencee)
+        reference_list.retain(|reference| {
+            paper_list
+                .iter()
+                .any(|paper| paper.id() == Some(reference.referencer.clone()).as_deref())
+                && paper_list
+                    .iter()
+                    .any(|paper| paper.id() == Some(reference.referencee.clone()).as_deref())
         });
     }
 
     // make a DOT file
     println!("digraph {{");
-    for (paper_key, paper) in paper_list {
+    for paper in paper_list {
         println!(
-            "    \"{paper_key:?}\" [label=\"{}\",URL=\"{}\",id=\"{}\"];",
-            escape(paper.title),
-            paper.url,
-            paper.id
+            "    \"{}\" [label=\"{}\",URL=\"{}\"];",
+            paper.id().expect("paper id"),
+            escape(paper.title()),
+            paper.url().unwrap_or_default(),
         );
     }
-    for (referencer, referencee) in reference_list {
-        println!("    \"{referencer:?}\" -> \"{referencee:?}\";");
+    for Reference {
+        referencer,
+        referencee,
+    } in reference_list
+    {
+        println!("    {referencer:?} -> {referencee:?};");
     }
     println!("}}");
 
@@ -188,9 +188,6 @@ mod tests {
     use super::*;
     #[test]
     fn escape_a_string() {
-        assert_eq!(
-            escape("asdf \"foo\" \\aaa".into()),
-            "asdf \\\"foo\\\" \\\\aaa"
-        );
+        assert_eq!(escape("asdf \"foo\" \\aaa"), "asdf \\\"foo\\\" \\\\aaa");
     }
 }
