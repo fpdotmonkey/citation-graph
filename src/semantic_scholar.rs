@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
 use serde::Deserialize;
+use tokio::task::JoinSet;
 
 const API_BATCH: &str = "https://api.semanticscholar.org/graph/v1/paper/batch";
 const MAX_PAPERS_PER_BATCH_CALL: usize = 500;
@@ -116,33 +117,42 @@ impl SemanticScholar {
             "fields",
             "title,url,references.paperId,references.title,references.url",
         )];
-        let mut papers = Vec::<Paper>::new();
+        let mut requests = JoinSet::new();
         for i in 0..std::cmp::max(paper_ids.len() / MAX_PAPERS_PER_BATCH_CALL, 1) {
+            let low_index = i * MAX_PAPERS_PER_BATCH_CALL;
+            let high_index = std::cmp::min((1 + i) * MAX_PAPERS_PER_BATCH_CALL, paper_ids.len());
             eprintln!(
                 "POST /graph/v1/paper/batch: {} papers",
-                std::cmp::min((1 + i) * MAX_PAPERS_PER_BATCH_CALL, paper_ids.len())
-                    - i * MAX_PAPERS_PER_BATCH_CALL
+                high_index - low_index
             );
             let mut ids = HashMap::<&str, Vec<String>>::new();
             ids.insert(
                 "ids",
-                paper_ids[i * MAX_PAPERS_PER_BATCH_CALL
-                    ..std::cmp::min((1 + i) * MAX_PAPERS_PER_BATCH_CALL, paper_ids.len())]
+                paper_ids[low_index..high_index]
                     .iter()
                     .map(|id| id.to_string())
                     .collect(),
             );
 
-            let request = self
-                .client
-                .post(API_BATCH)
-                .json(&ids)
-                .query(&params)
-                .send()
-                .await
-                .unwrap();
-            let almost_papers = request.json::<Vec<Option<Paper>>>().await.unwrap();
-            papers.extend(almost_papers.into_iter().flatten().collect::<Vec<Paper>>());
+            requests.spawn(self.client.post(API_BATCH).json(&ids).query(&params).send());
+        }
+        let mut responses = JoinSet::new();
+        while let Some(response) = requests.join_next().await {
+            responses.spawn(
+                response
+                    .expect("response future join")?
+                    .json::<Vec<Option<Paper>>>(),
+            );
+        }
+        let mut papers = Vec::<Paper>::new();
+        while let Some(paper) = responses.join_next().await {
+            papers.extend(
+                paper
+                    .expect("paper future join")?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<Paper>>(),
+            );
         }
         Ok(papers)
     }
