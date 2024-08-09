@@ -1,7 +1,28 @@
 use std::collections::{HashMap, HashSet};
 
-mod semantic_scholar;
+use argh::FromArgs;
+
 use semantic_scholar::{Paper, PaperId, ProtoPaper, SemanticScholar};
+
+mod id_import;
+mod semantic_scholar;
+
+#[derive(FromArgs)]
+/// Generate a citation graph based on the contents of a bibliography.
+pub struct Cli {
+    /// the path to a Bib(La)TeX bibliography
+    #[argh(positional)]
+    bibliography: String,
+    /// how many search iterations should be performed
+    #[argh(option, default = "3")]
+    max_depth: usize,
+    /// the citation density your bibliography's reference network.
+    ///
+    /// Informally, try to tune this so only some dozens of papers are
+    /// searched in the last iteration.
+    #[argh(option, default = "1.8")]
+    connectivity: f64,
+}
 
 struct StagingData {
     citation_count: usize,
@@ -50,22 +71,20 @@ fn from_staging(staging: &Staging) -> PaperList {
 }
 
 #[tokio::main]
-async fn main() -> reqwest::Result<()> {
-    let api = SemanticScholar::default();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli: Cli = argh::from_env();
 
-    let paper_ids = vec![
-        PaperId::Doi("10.1016/j.jterra.2024.100989".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100988".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100998".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100999".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100975".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100976".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100977".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100984".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100985".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100987".to_string()),
-        PaperId::Doi("10.1016/j.jterra.2024.100986".to_string()),
-    ];
+    let paper_ids =
+        match id_import::try_from_bibtex(std::fs::read_to_string(cli.bibliography)?) {
+            Err(id_import::Error::SomeKeysMissing(err)) => {
+                eprintln!("{err:?}; continuing anyway");
+                Ok(err.get_ids())
+            }
+            other => other,
+        }?;
+    let paper_ids = semantic_scholar::parse_ids(paper_ids);
+
+    let api = SemanticScholar::default();
     let mut staging = Staging::default();
     // one request before the loop to avoid creating a special cases
     staging.extend(api.get_paper_batch(paper_ids).await?);
@@ -73,14 +92,14 @@ async fn main() -> reqwest::Result<()> {
     let mut reference_list = ReferenceList::default();
 
     // And now the rest of the requests.
-    for depth in 0..4 {
+    for depth in 0..cli.max_depth {
         eprintln!("depth={depth}");
         let mut staged_paper_list = PaperList::default();
         let mut staged_reference_list = ReferenceList::default();
         let mut remove_staged = Vec::<String>::default();
         let mut batched_papers = Vec::<PaperId>::default();
         for (id, staged) in &staging {
-            if staged.citation_count < (depth as f64 * 1.6).exp().floor() as usize {
+            if staged.citation_count < (depth as f64 * cli.connectivity).exp().floor() as usize {
                 continue;
             }
             staged_reference_list.extend(

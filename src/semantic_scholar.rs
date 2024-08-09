@@ -5,6 +5,10 @@ use serde::Deserialize;
 
 const API_BATCH: &str = "https://api.semanticscholar.org/graph/v1/paper/batch";
 const MAX_PAPERS_PER_BATCH_CALL: usize = 500;
+// from https://www.crossref.org/blog/dois-and-matching-regular-expressions/
+const DOI_REGEX: &str = r#"(?<id>10.\d{4,9}/[-._;()/:A-Z0-9]+)$"#;
+const SEMANTIC_SCHOLAR_REGEX: &str =
+    r#"^(https?://)?(www\.)?semanticscholar.org/paper/(?<id>[0-9a-f]+)$"#;
 
 #[derive(Default)]
 pub struct SemanticScholar {
@@ -35,11 +39,28 @@ pub struct Paper {
 }
 
 impl Display for PaperId {
+    /// Write out in the format the API expects for the ids.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             PaperId::Doi(id) => write!(f, "DOI:{id}"),
             PaperId::SemanticScholar(id) => write!(f, "{id}"),
         }
+    }
+}
+
+impl TryFrom<&str> for PaperId {
+    type Error = ();
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let doi_regex = regex::Regex::new(DOI_REGEX).unwrap();
+        let semantic_scholar_regex = regex::Regex::new(SEMANTIC_SCHOLAR_REGEX).unwrap();
+        if let Some(caps) = doi_regex.captures(s) {
+            return Ok(Self::Doi(caps["id"].to_string()));
+        }
+        if let Some(caps) = semantic_scholar_regex.captures(s) {
+            return Ok(Self::SemanticScholar(caps["id"].to_string()));
+        }
+        Err(())
     }
 }
 
@@ -112,30 +133,24 @@ impl SemanticScholar {
                     .collect(),
             );
 
-            let Ok(almost_papers) = self
+            let request = self
                 .client
                 .post(API_BATCH)
                 .json(&ids)
                 .query(&params)
                 .send()
-                .await?
-                .json::<Vec<Option<Paper>>>()
                 .await
-            else {
-                let text = self
-                    .client
-                    .post(API_BATCH)
-                    .json(&ids)
-                    .query(&params)
-                    .send()
-                    .await?
-                    .text()
-                    .await?;
-                eprintln!("{text:#}");
-                panic!("failed json serialization");
-            };
+                .unwrap();
+            let almost_papers = request.json::<Vec<Option<Paper>>>().await.unwrap();
             papers.extend(almost_papers.into_iter().flatten().collect::<Vec<Paper>>());
         }
         Ok(papers)
     }
+}
+
+pub fn parse_ids(ids: Vec<String>) -> Vec<PaperId> {
+    ids.into_iter()
+        .map(|id: String| id.as_str().try_into())
+        .filter_map(|id: Result<PaperId, ()>| id.ok())
+        .collect()
 }
