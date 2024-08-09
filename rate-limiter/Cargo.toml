@@ -1,0 +1,10 @@
+[package]
+name = "rate-limiter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+endpoints = { version = "0.1.0", path = "../endpoints" }
+leaky-bucket = "1.1.2"
+reqwest = { version = "0.12.5", features = ["json"] }
+rocket = { version = "0.5.1", features = ["json"] }

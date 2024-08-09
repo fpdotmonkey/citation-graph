@@ -80,7 +80,10 @@ pub fn try_from_bibtex(bibtex_src: impl AsRef<str>) -> Result<Vec<String>, Error
                 Err(err) => missing_keys.push(err),
             };
         }
-        return Err(Error::SomeKeysMissing(SomeMissingKeys { missing_keys, ids }));
+        return Err(Error::SomeKeysMissing(SomeMissingKeys {
+            missing_keys,
+            ids,
+        }));
     }
     Ok(maybe_ids.into_iter().filter_map(|id| id.ok()).collect())
 }
