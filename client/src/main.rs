@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use argh::FromArgs;
-
 use semantic_scholar::{Paper, PaperId, ProtoPaper, SemanticScholar};
 
 mod id_import;
@@ -13,6 +12,9 @@ pub struct Cli {
     /// the path to a Bib(La)TeX bibliography
     #[argh(positional)]
     bibliography: String,
+    /// what URL will be serving the API
+    #[argh(option, default = "\"api.fletcherporter.com/s2\".into()")]
+    base_uri: String,
     /// how many search iterations should be performed
     #[argh(option, default = "3")]
     max_depth: usize,
@@ -74,17 +76,16 @@ fn from_staging(staging: &Staging) -> PaperList {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli: Cli = argh::from_env();
 
-    let paper_ids =
-        match id_import::try_from_bibtex(std::fs::read_to_string(cli.bibliography)?) {
-            Err(id_import::Error::SomeKeysMissing(err)) => {
-                eprintln!("{err:?}; continuing anyway");
-                Ok(err.get_ids())
-            }
-            other => other,
-        }?;
+    let paper_ids = match id_import::try_from_bibtex(std::fs::read_to_string(cli.bibliography)?) {
+        Err(id_import::Error::SomeKeysMissing(err)) => {
+            eprintln!("{err:?}; continuing anyway");
+            Ok(err.get_ids())
+        }
+        other => other,
+    }?;
     let paper_ids = semantic_scholar::parse_ids(paper_ids);
 
-    let api = SemanticScholar::default();
+    let api = SemanticScholar::new(cli.base_uri);
     let mut staging = Staging::default();
     // one request before the loop to avoid creating a special cases
     staging.extend(api.get_paper_batch(paper_ids).await?);

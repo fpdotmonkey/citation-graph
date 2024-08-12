@@ -3,12 +3,10 @@ use std::fmt::{Display, Formatter};
 
 use serde::Deserialize;
 use tokio::task::JoinSet;
-use tokio::time;
 
-const API_BATCH: &str = "https://api.semanticscholar.org/graph/v1/paper/batch";
-const API_KEY_HEADER: &str = "x-api-key";
+use endpoints::PAPER_BATCH;
+
 const MAX_PAPERS_PER_BATCH_CALL: usize = 500;
-const RATE_LIMIT_TIME_PER_REQUEST: time::Duration = time::Duration::from_millis(1000);
 
 // from https://www.crossref.org/blog/dois-and-matching-regular-expressions/
 const DOI_REGEX: &str = r#"(?<id>10.\d{4,9}/[-._;()/:A-Z0-9]+)$"#;
@@ -16,10 +14,8 @@ const SEMANTIC_SCHOLAR_REGEX: &str =
     r#"^(https?://)?(www\.)?semanticscholar.org/paper/(?<id>[0-9a-f]+)$"#;
 const ID_CAPTURE: &str = "id";
 
-const ENV_API_KEY: &str = "API_KEY";
-
-#[derive(Default)]
 pub struct SemanticScholar {
+    base_uri: String,
     client: reqwest::Client,
 }
 
@@ -50,8 +46,6 @@ pub enum Error {
     Request(reqwest::Error),
     Join(tokio::task::JoinError),
     Serialization(serde_json::Error, String),
-    ApiKeyNotSet,
-    RateLimit,
 }
 
 impl std::fmt::Debug for Error {
@@ -60,11 +54,6 @@ impl std::fmt::Debug for Error {
             Error::Request(err) => std::fmt::Debug::fmt(err, f),
             Error::Join(err) => std::fmt::Debug::fmt(err, f),
             Error::Serialization(err, text) => write!(f, "{text}\n{err:?}"),
-            Error::ApiKeyNotSet => write!(
-                f,
-                "environment variable API_KEY=<semantic-scholar-api-key> needs to be set"
-            ),
-            Error::RateLimit => write!(f, "rate limited by Semantic Scholar"),
         }
     }
 }
@@ -81,7 +70,6 @@ impl std::error::Error for Error {
             Error::Request(err) => Some(err),
             Error::Join(err) => Some(err),
             Error::Serialization(err, _text) => Some(err),
-            Error::ApiKeyNotSet => None,
         }
     }
 }
@@ -155,16 +143,18 @@ impl From<Paper> for ProtoPaper {
 }
 
 impl SemanticScholar {
+    pub fn new(base_uri: String) -> Self {
+        Self {
+            base_uri,
+            client: reqwest::Client::new(),
+        }
+    }
+
     pub async fn get_paper_batch(&self, paper_ids: Vec<PaperId>) -> Result<Vec<Paper>, Error> {
         if paper_ids.is_empty() {
             eprintln!("no papers requested");
             return Ok(vec![]);
         }
-        let api_key = match std::env::var(ENV_API_KEY) {
-            Ok(key) if key == *"" => Err(Error::ApiKeyNotSet),
-            Err(_) => Err(Error::ApiKeyNotSet),
-            Ok(key) => Ok(key),
-        }?;
         let params = [(
             "fields",
             "title,url,references.paperId,references.title,references.url",
@@ -188,8 +178,7 @@ impl SemanticScholar {
 
             requests.spawn(
                 self.client
-                    .post(API_BATCH)
-                    .header(API_KEY_HEADER, &api_key)
+                    .post(format!("{}{}", self.base_uri, PAPER_BATCH))
                     .json(&ids)
                     .query(&params)
                     .send(),
@@ -200,12 +189,7 @@ impl SemanticScholar {
             responses.spawn(
                 response
                     .map_err(Error::Join)?
-                    .map_err(|err| match err {
-                        error if error.status() == Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => {
-                            Error::RateLimit
-                        }
-                        error => Error::Request(error),
-                    })?
+                    .map_err(Error::Request)?
                     .text(),
             );
         }
