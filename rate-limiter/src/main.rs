@@ -28,7 +28,7 @@ const HEADER_API_KEY: &str = "x-api-key";
 
 const SEMANTIC_SCHOLAR_BASE_URI: &str = "https://api.semanticscholar.org";
 // the rate limit is 1 req/s.  I'll slow it by a little for safety.
-const RATE_LIMIT_PERIOD: time::Duration = time::Duration::from_millis(1000);
+const RATE_LIMIT_PERIOD: time::Duration = time::Duration::from_millis(1100);
 const RATE_LIMIT_COUNT: usize = 1;
 
 struct ApiKeyMissing {}
@@ -94,7 +94,12 @@ async fn paper_batch(
             Ok((status, body)) => match status {
                 // Status::Constant can't be a pattern because it has a
                 // manual impl ParitalEq, instead of #[derive].
-                status if status == Status::TooManyRequests => (), // try again
+                status
+                    if (status == Status::TooManyRequests || status == Status::GatewayTimeout) =>
+                {
+                    // try again
+                }
+
                 status
                     if matches!(
                         status.class(),

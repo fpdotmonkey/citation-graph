@@ -16,13 +16,13 @@ pub struct Cli {
     #[argh(option, default = "\"api.fletcherporter.com/s2\".into()")]
     base_uri: String,
     /// how many search iterations should be performed
-    #[argh(option, default = "3")]
+    #[argh(option, default = "4")]
     max_depth: usize,
     /// the citation density your bibliography's reference network.
     ///
     /// Informally, try to tune this so only some dozens of papers are
     /// searched in the last iteration.
-    #[argh(option, default = "1.8")]
+    #[argh(option, default = "3.25")]
     connectivity: f64,
 }
 
@@ -99,8 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut staged_reference_list = ReferenceList::default();
         let mut remove_staged = Vec::<String>::default();
         let mut batched_papers = Vec::<PaperId>::default();
+
+        let minimum_citations = (depth as f64 * cli.connectivity.ln()).exp().floor() as usize;
         for (id, staged) in &staging {
-            if staged.citation_count < (depth as f64 * cli.connectivity).exp().floor() as usize {
+            if staged.citation_count < minimum_citations {
                 continue;
             }
             staged_reference_list.extend(

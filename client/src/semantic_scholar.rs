@@ -160,7 +160,7 @@ impl SemanticScholar {
             "title,url,references.paperId,references.title,references.url",
         )];
         let mut requests = JoinSet::new();
-        for i in 0..std::cmp::max(paper_ids.len() / MAX_PAPERS_PER_BATCH_CALL, 1) {
+        for i in 0..paper_ids.len().div_ceil(MAX_PAPERS_PER_BATCH_CALL) {
             let low_index = i * MAX_PAPERS_PER_BATCH_CALL;
             let high_index = std::cmp::min((1 + i) * MAX_PAPERS_PER_BATCH_CALL, paper_ids.len());
             eprintln!(
